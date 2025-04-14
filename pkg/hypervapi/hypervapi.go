@@ -2,6 +2,7 @@ package hypervapi
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os/exec"
@@ -9,7 +10,7 @@ import (
 )
 
 const (
-	defaultDomainNameSuffix = ".exmaple.com"
+	defaultDomainNameSuffix = ".example.com"
 	defaultComment          = "managed by api - hyper-vm"
 )
 
@@ -141,4 +142,112 @@ func (h *HyperVManager) GetVMIPByVMName(vmName string) (*IP, error) {
 	}
 
 	return ipInfo, nil
+}
+
+// NetworkAdapterInfo holds information about a VM's network adapter
+type NetworkAdapterInfo struct {
+	Name        string   `json:"Name"`
+	SwitchName  string   `json:"SwitchName"`
+	IPAddresses []string `json:"IPAddresses"`
+}
+
+// GetVMPreferredIPByVMName retrieves the preferred IPv4 address for a Hyper-V VM.
+// It prioritizes IPs from the "Default Switch" and excludes APIPA addresses.
+func GetVMPreferredIPByVMName(vmName string) (string, error) {
+	cmd := exec.Command("powershell", fmt.Sprintf("Get-VMNetworkAdapter -VMName '%s' | Select-Object Name, SwitchName, IPAddresses | ConvertTo-Json", vmName))
+	var out bytes.Buffer
+	var errStr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errStr
+	err := cmd.Run()
+	if err != nil {
+		output := out.String() + errStr.String()
+		if strings.Contains(output, "No object was found") || strings.Contains(output, "cannot find a virtual machine") {
+			return "", fmt.Errorf("vm '%s' not found or has no network adapters", vmName)
+		}
+		return "", fmt.Errorf("failed to execute PowerShell command: %w, output: %s", err, output)
+	}
+
+	jsonOut := strings.TrimSpace(out.String())
+	if !strings.HasPrefix(jsonOut, "[") && strings.HasPrefix(jsonOut, "{") {
+		jsonOut = "[" + jsonOut + "]"
+	}
+
+	var adapters []NetworkAdapterInfo
+	err = json.Unmarshal([]byte(jsonOut), &adapters)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse PowerShell JSON output: %w, output: %s", err, jsonOut)
+	}
+
+	const apipaFirstOctet = 169
+	const apipaSecondOctet = 254
+	preferredSwitch := "Default Switch"
+
+	var preferredIP string
+	var fallbackIP string
+
+	for _, adapter := range adapters {
+		for _, ipStr := range adapter.IPAddresses {
+			ip := net.ParseIP(ipStr)
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.To4() == nil {
+				continue
+			}
+			if ip[0] == apipaFirstOctet && ip[1] == apipaSecondOctet {
+				continue
+			}
+			if adapter.SwitchName == preferredSwitch && preferredIP == "" {
+				preferredIP = ip.String()
+			}
+			if fallbackIP == "" {
+				fallbackIP = ip.String()
+			}
+		}
+	}
+
+	if preferredIP != "" {
+		return preferredIP, nil
+	}
+	if fallbackIP != "" {
+		return fallbackIP, nil
+	}
+	return "", fmt.Errorf("no suitable IPv4 address found for VM '%s'", vmName)
+}
+
+// GetVMIPByVMName retrieves all IP addresses for a specific Hyper-V VM.
+// Consider using GetVMPreferredIPByVMName for a single, prioritized IP.
+func GetVMIPByVMName(vmName string) ([]string, error) {
+	cmd := exec.Command("powershell", fmt.Sprintf("Get-VMNetworkAdapter -VMName '%s' | Select-Object -ExpandProperty IPAddresses", vmName))
+	var out bytes.Buffer
+	var errStr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errStr
+	err := cmd.Run()
+	if err != nil {
+		output := out.String() + errStr.String()
+		if strings.Contains(output, "No object was found") || strings.Contains(output, "cannot find a virtual machine") {
+			return nil, fmt.Errorf("vm '%s' not found", vmName)
+		}
+		return nil, fmt.Errorf("failed to execute PowerShell command: %w, output: %s", err, output)
+	}
+
+	ips := strings.Fields(out.String())
+	if len(ips) == 0 && strings.TrimSpace(out.String()) != "" {
+		ips = []string{strings.TrimSpace(out.String())}
+	} else if len(ips) == 0 {
+		return nil, fmt.Errorf("no IP addresses found for VM '%s'", vmName)
+	}
+
+	var validIPs []string
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip != nil {
+			validIPs = append(validIPs, ip.String())
+		}
+	}
+
+	if len(validIPs) == 0 {
+		return nil, fmt.Errorf("no valid IP addresses found after parsing for VM '%s'", vmName)
+	}
+
+	return validIPs, nil
 }

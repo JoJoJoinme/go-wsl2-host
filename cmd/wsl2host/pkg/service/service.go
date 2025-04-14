@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"regexp"
@@ -89,31 +90,32 @@ func RunHyperVMCheckAndUpdate(elog debug.Log) error {
 }
 
 func updateHostIPOfVm(elog debug.Log, vmInfos []*hypervapi.VMInfo) error {
-	// update the ip to the vm
-	hapi, err := hostsapi.CreateAPI("hyper-vm") // filtere only managed host entries
+	hapi, err := hostsapi.CreateAPI("hyper-vm") // filter only managed host entries
 	if err != nil {
 		elog.Error(1, fmt.Sprintf("failed to create hosts api: %v", err))
 		return fmt.Errorf("failed to create hosts api: %w", err)
 	}
 
 	fmt.Printf("old hapi entry info:%v\n", hapi.Entries())
-
 	updated := false
 
-	// update the vm ip to host
 	for _, info := range vmInfos {
-		hostname := info.GeDefaulttDomainName()
-		for _, ip := range info.GetIPV4() {
-			// update IPs of running distros
-			// add running distros not present
-			isUpsert := hapi.IsUpsertEntry(&hostsapi.HostEntry{
-				Hostname: hostname,
-				IP:       ip,
-				Comment:  info.GetComent(),
-			})
-			if isUpsert {
-				updated = true
-			}
+		ipStr, err := hypervapi.GetVMPreferredIPByVMName(info.Name)
+		if err != nil {
+			log.Printf("Could not get preferred IP for Hyper-V VM %s: %v", info.Name, err)
+			continue
+		}
+		if ipStr == "" {
+			log.Printf("No valid IP found for VM %s", info.Name)
+			continue
+		}
+		entry := &hostsapi.HostEntry{
+			Hostname: info.GeDefaulttDomainName(),
+			IP:       ipStr,
+			Comment:  info.GetComent(),
+		}
+		if hapi.IsUpsertEntry(entry) {
+			updated = true
 		}
 	}
 
@@ -123,14 +125,11 @@ func updateHostIPOfVm(elog debug.Log, vmInfos []*hypervapi.VMInfo) error {
 			elog.Error(1, fmt.Sprintf("failed to write hosts file: %v", err))
 			return fmt.Errorf("failed to write hosts file: %w", err)
 		}
-
 		// restart the IP Helper service (iphlpsvc) for port forwarding
 		exec.Command("C:\\Windows\\System32\\cmd.exe", "/C net stop  iphlpsvc").Run()
 		exec.Command("C:\\Windows\\System32\\cmd.exe", "/C net start iphlpsvc").Run()
 	}
-
 	return nil
-
 }
 
 func updateHostIP(elog debug.Log, distros []*wslapi.DistroInfo) error {
@@ -256,7 +255,7 @@ func updateHostIP(elog debug.Log, distros []*wslapi.DistroInfo) error {
 	return nil
 }
 
-/// Write all other distro and host into the hosts file for each distro.
+// / Write all other distro and host into the hosts file for each distro.
 func updateDistroIP(elog debug.Log, distros []*wslapi.DistroInfo, distro string) error {
 	host_ip, err := hostsapi.GetHostIPV2()
 	if err != nil {
